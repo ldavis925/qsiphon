@@ -1,0 +1,453 @@
+#!/usr/bin/perl
+
+##
+## $Id:$
+## $Source:$
+##
+
+=pod
+
+=head1 NAME
+
+queueclean - Analyze and display mail queue statistics
+
+=head1 SYNOPSIS
+
+queueclean [-W E<verbar> --wrap] [B<base-queue-directory>]
+
+=head1 DESCRIPTION
+
+This script analyzes sendmail QF files and dumps some simple statistics on the message sampling.
+
+if the B<--wrap> switch is given on the command line then prior to executing the F<qsiphon> utility
+application, queueclean will wrap its execution with a sendmail stop and start.
+
+If B<base_queue_directory> is omitted this script will use the default base directory located 
+at F</var/spool/mqueue/>.
+
+=cut
+
+use strict;
+use warnings;
+use IO::Dir;
+use File::Temp;
+use File::Spec::Functions;
+use File::Path qw(rmtree mkpath);
+use Getopt::Long;
+
+use constant TOP_LISTINGS        => 6;
+use constant MAX_SUBJECT_LEN     => 25;
+use constant MAX_DISPLAY_LEN     => 80;
+use constant BASE_QUEUE_DIR      => '/var/spool/mqueue';
+use constant QSIPHON_EXEC        => '/usr/local/bin/qsiphon';
+use constant DEFAULT_PERSISTENCE => '6h30m';
+use constant BASE_QS_SPOOLDIR    => '/var/spool/qsspool';
+use constant PATH_DEVNULL        => '/dev/null';
+
+##
+## Configurable somewhat -- RFC822 SMTP headers that we will track stats for
+my %parse_map       = ( 
+    From    => { lregex => '^H\\?\\?From: ',    regex => qr/^H\?\?From:\s*(.*)$/,    },
+    To      => { lregex => '^H\\?\\?To: ',      regex => qr/^H\?\?To:\s*(.*)$/,      },
+    Subject => { lregex => '^H\\?\\?Subject: ', regex => qr/^H\?\?Subject:\s*(.*)$/, },
+);
+my @saved_tags      = keys %parse_map;
+my %id_map          = map { uc(substr($_, 0, 1)), $parse_map{$_} } @saved_tags;
+my @mail_queue_dirs = ();
+my %mail_stats = (
+    Count => 0,
+    map { $_ => { } } @saved_tags,
+);
+my @trash_talk      = (
+    qr/Spamtraphit/,
+);
+
+my ($opt_wrap);
+
+Getopt::Long::Configure("bundling");
+GetOptions(
+    "W|wrap"        => \$opt_wrap,
+);
+exit(main(@ARGV));
+
+sub main {
+    my @args = @_;
+    my $base_queue_dir  = shift(@args) || BASE_QUEUE_DIR;
+
+    die("Invalid base queue directory: $base_queue_dir\n") unless -d $base_queue_dir;
+    die("This script requires privilege (must be super-user)\n") if $>;
+
+    @mail_queue_dirs = discover_multi_queues( $base_queue_dir );
+    my $stats;
+
+    for my $mdir ( @mail_queue_dirs ) {
+        print STDOUT "Reading ", $mdir, "...";
+        $stats = process_probes( $mdir, \%mail_stats );
+        print STDOUT "\n";
+    }
+
+    my $ordered_stats = order_stats( $stats );
+    my $id = print_stats( $base_queue_dir, $stats->{Count}, $ordered_stats );
+    if ($id) {
+	my $a = query("[R]un or [P]ersist ('q' to quit)? [R|P|q]: ",
+	    sub { 
+		my $v = $_[0];
+		return    unless $v;
+		return -1 if ( $v =~ /^q$/i    );
+		return  1 if ( $v =~ /^[rp]$/i );
+		return;
+	    },
+	);
+	return(0) unless $a;
+	$a = uc(substr($a, 0, 1));
+	Q_SWITCH: {
+	    $a eq 'R' && do {
+		run_qsiphon($ordered_stats, $id, $base_queue_dir, \@mail_queue_dirs);
+		last Q_SWITCH;
+	    };
+	    $a eq 'P' && do {
+		persist($ordered_stats, $id, $base_queue_dir, \@mail_queue_dirs);
+		last Q_SWITCH;
+	    };
+	};
+    }
+
+    return(0);
+}
+
+sub hms_to_seconds {
+    my ($hms_str) = @_;
+    return unless $hms_str;
+
+    $hms_str = lc($hms_str);
+    my $seconds = 0;
+    my @matches = $hms_str =~ m{ ( \d+ [[:alpha:]] ) }xsmg;
+
+    for my $match (@matches) {
+        my ($inc, $type) = $match =~ m{ ( \d+ ) ( [[:alpha:]] ) }x;
+        SWITCH: {
+            $type eq 'h' && do {
+                $seconds += ( $inc * 3600 );
+                last SWITCH;
+            };
+
+            $type eq 'm' && do {
+                $seconds += ( $inc * 60 );
+                last SWITCH;
+            };
+
+            $type eq 's' && do {
+                $seconds += $inc;
+                last SWITCH;
+            };
+
+            print "Time designation '$type' is not valid.\n";
+            return;
+        }
+    }
+
+    return $seconds;
+}
+
+sub hms_to_epoch {
+    my ($hms_str) = @_;
+    return unless $hms_str;
+
+    my $now     = time();
+    my $seconds = hms_to_seconds($hms_str);
+    my $epoch   = $now + $seconds;
+
+    return ($now, $epoch, $seconds) if wantarray;
+    return $epoch;
+}
+
+sub hms_to_str {
+    my ($hms_str) = @_;
+    return unless $hms_str;
+
+    my $seconds = hms_to_seconds($hms_str);
+    my @desc    = ();
+
+    my $hours   = int( $seconds / 3600 );
+    $seconds    = $seconds % 3600;
+
+    my $minutes = int( $seconds / 60 );
+    $seconds    = $seconds % 60;
+
+    push @desc, sprintf('%s hour%s', $hours, ($hours == 1) ? '' : 's')
+        if $hours;
+    push @desc, sprintf('%s minute%s', $minutes, ($minutes == 1) ? '' : 's')
+        if $minutes;
+    push @desc, sprintf('%s second%s', $seconds, ($seconds == 1) ? '' : 's')
+        if $seconds;
+
+    return unless scalar(@desc);
+    return join(', ' => @desc);
+}
+
+sub query {
+    my ($prompt, $cbv) = @_;
+    chomp($prompt);
+    $prompt .= ': ' unless ( $prompt =~ /: $/ );
+    my $answer;
+    VALID: {
+        print "$prompt";
+	$answer = <STDIN>;
+	chomp($answer);
+	if ($cbv && ref($cbv) eq 'CODE') {
+	    my $valid = $cbv->( $answer );
+	    unless( defined( $valid ) ) {
+		print "Incorrect response -- please re-enter.\n";
+		redo VALID;
+	    }
+	    return if ( $valid && $valid == -1 );
+	}
+    }
+    return $answer;
+}
+
+sub discover_multi_queues {
+    my ( $basedir ) = @_;
+    my @queuedirs   = ();
+
+    QDIR: for my $i ( 0 .. 9 ) {
+        my $qdir  = catdir( $basedir, sprintf( 'q%s' => $i ) );
+        my $isdir = ( $qdir && -d $qdir );
+        if ( $i == 0 ) {
+            unless ( $isdir ) {
+                push @queuedirs, $basedir;
+                last QDIR;
+            }
+        }
+        push @queuedirs, $qdir if ( $isdir );
+    }
+
+    return @queuedirs;
+}
+
+sub order_stats {
+    my ( $mail_stats ) = @_;
+    my %header_stats = ();
+    for my $tag ( @saved_tags ) {
+        my @sorted = sort { $mail_stats->{$tag}->{$b} <=> $mail_stats->{$tag}->{$a} } 
+            keys %{ $mail_stats->{$tag} };
+        my $max    = scalar(@sorted) >= TOP_LISTINGS ? TOP_LISTINGS - 1 : $#sorted;
+        for my $i ( 0 .. $max ) {
+            my $label = $sorted[ $i ];
+            my $count = $mail_stats->{$tag}->{$label};
+            my $itag  = sprintf('%s%s', uc(substr($tag, 0, 1)), $i);
+            ##
+            ## Create two indexes to find the data...
+            ##
+            $header_stats{$tag}->{$itag}->{label} = $label;
+            $header_stats{$itag}->{label} = $label;
+            $header_stats{$tag}->{$itag}->{count} = $count;
+            $header_stats{$itag}->{count} = $count;
+        }
+    }
+    return \%header_stats;
+}
+
+sub print_stats {
+    my ( $probe_dir, $count, $ordered_stats ) = @_;
+    printf "Probe Directory [%s] - Queue count [%s]\n", $probe_dir, $count;
+    printf "Header statistics:\n";
+    for my $tag ( @saved_tags ) {
+        printf "%-s:\n", $tag;
+        printf "    ID  Count Matched\n";
+        for my $seq (sort { substr($a, 1) <=> substr($b, 1) } keys %{ $ordered_stats->{$tag} }) {
+            my $label = $ordered_stats->{$tag}->{$seq}->{label};
+            $label = substr($label, 0, MAX_DISPLAY_LEN) . '...'
+                if (length($label) > MAX_DISPLAY_LEN);
+            my $count = $ordered_stats->{$tag}->{$seq}->{count};
+            printf("    %s %6d [%-s]\n", $seq, $count, $label);
+        }
+    }
+    print "\n";
+
+    my $prog = QSIPHON_EXEC;
+    unless ( $prog && -x $prog ) {
+        print "Cannot prompt for ID because qsiphon is missing on this host.\n";
+        return;
+    }
+
+    print "ID to siphon ('q' to quit): ";
+    my $id = <STDIN>;
+    chomp($id);
+    if ( !( $id ) || $id =~ /^q/i ) {
+        print "*** Break ***\n";
+        return;
+    }
+    $id = uc( $id );
+    unless ( exists $ordered_stats->{$id} ) {
+        print "Bad ID\n";
+        return;
+    }
+
+    return $id;
+}
+
+sub create_dir {
+    my ($dir, $perms) = @_;
+    return unless $dir;
+    mkpath $dir unless ( -d $dir );
+    chmod $perms, $dir if $perms;
+    return;
+}
+
+sub create_spool {
+    my ($regex, $epoch) = @_;
+
+    my $base_spool = BASE_QS_SPOOLDIR;
+    create_dir( $base_spool, 01777 );
+
+    my $template = sprintf('QC-N-%s-XXXXXX', $epoch);
+    my $fh = File::Temp->new(
+        DIR      => $base_spool,
+        TEMPLATE => $template,
+        UNLINK   => 0,
+    );
+
+    my $filename = $fh->filename();
+    $regex =~ s{^H\?\?}{H\\?\\?};
+    $regex =~ s{^\^}{};
+
+    printf $fh "REGEX=%s\n", $regex;
+
+    $fh->close();
+    chmod( 0644, $filename );
+    return $filename;
+}
+
+sub persist {
+    my ($ordered_stats, $id, $basedir, $mqdirs) = @_;
+    my $fc     = uc( substr($id, 0, 1) );
+    my $lregex = $id_map{$fc}->{lregex};
+    my $data   = $ordered_stats->{$id}->{label};
+    my $creg   = $lregex . "\Q${data}\E";
+
+    my $def_persist      = DEFAULT_PERSISTENCE;
+    my $def_persist_desc = hms_to_str( $def_persist );
+    my $persist = query(
+	"Persist for [ENTER for ${def_persist} (${def_persist_desc}), 'q' to quit]: ",
+	sub {
+	    my $v = $_[0];
+	    return    unless defined($v);
+	    return -1 if ( $v =~ /^q$/i    );
+	    return  1 if ( !(length $v) or $v =~ /^[\dhms]+$/i );
+	    return;
+	},
+    );
+
+    return unless defined( $persist );
+
+    $persist ||= $def_persist;
+    $persist   = lc $persist;
+
+    my $epoch = hms_to_epoch( $persist );
+    my $fname = create_spool($creg, $epoch);
+    print "Created spool: $fname\n";
+
+    return;
+}
+
+sub run_qsiphon {
+    my ($ordered_stats, $id, $basedir, $mqdirs) = @_;
+    my $fc     = uc( substr($id, 0, 1) );
+    my $lregex = $id_map{$fc}->{lregex};
+    my $data   = $ordered_stats->{$id}->{label};
+    my $creg   = $lregex . "\Q${data}\E";
+    my $remdir = PATH_DEVNULL;
+    my $prog   = QSIPHON_EXEC;
+    my @stdout = ();
+    if ( $opt_wrap ) {
+        push @stdout, "service sendmail stop";
+        system("/sbin/service sendmail stop");
+    }
+    for my $mqd (@{ $mqdirs }) {
+        my $cmd = sprintf(qq{%s -U -M -R '%s' %s %s}, $prog, $creg, $mqd, $remdir);
+        push @stdout, $cmd;
+        system($cmd);
+    }
+    if ( $opt_wrap ) {
+        push @stdout, "service sendmail start";
+        system("/sbin/service sendmail start");
+    }
+    my $stdout = join('; ', @stdout);
+    print "Ran: $stdout", "\n";
+    return;
+}
+
+sub compute_mail_stats {
+    my ( $path ) = @_;
+    my %single_stat = map { $_ => '' } @saved_tags;
+    open( my $fh, '<', $path ) or return;
+    my @headers = <$fh>;
+    close( $fh );
+    chomp(@headers);
+    my $i = 0;
+    my $hdr_ndx = $#headers;
+    while ( $i <= $hdr_ndx ) {
+        my $current_line = $headers[$i];
+        last unless defined $current_line;
+        my $next_line    = $headers[$i + 1];
+        if ( $current_line =~ /^H\?\?/ && $next_line && $next_line =~ /^\s+/) {
+            $next_line =~ s/^\s+/ /g;
+            $headers[$i] .= $next_line;
+            splice @headers, $i + 1, 1;
+            --$hdr_ndx;
+        }
+        else {
+            $i++;
+        }
+    }
+    my $header = join("\n", @headers);
+    TAGS: for my $tag (@saved_tags) {
+        my $regex = $parse_map{$tag}->{regex};
+        my ( $field ) = $header =~ m/$regex/m;
+        next TAGS unless $field;
+        if ( $tag eq 'Subject' ) {
+            return if ( grep { $field =~ /$_/ } @trash_talk );
+            if ( length( $field ) > MAX_SUBJECT_LEN ) {
+                $single_stat{$tag} = substr( $field, 0, MAX_SUBJECT_LEN );
+                next TAGS;
+            }
+        }
+        $single_stat{$tag} = $field;
+    }
+    return \ %single_stat;
+}
+
+sub merge_stats {
+    my ( $mail_stats, $single_stat ) = @_;
+    for my $tag ( @saved_tags ) {
+        my $single_item = $single_stat->{$tag};
+        if ($single_item) {
+            if (exists($mail_stats->{$tag}->{$single_item})) {
+                $mail_stats->{$tag}->{$single_item} += 1;
+            }
+            else {
+                $mail_stats->{$tag}->{$single_item} = 1;
+            }
+        }
+    }
+    return;
+}
+
+sub process_probes {
+    my ( $dirname, $mail_stats ) = @_;
+    my $dirent = IO::Dir->new( $dirname ) or return;
+    QFFILES: while ( defined(my $file = $dirent->read) ) {
+        next QFFILES unless ($file && $file =~ m/^qf/);
+        my $path = catfile( $dirname, $file );
+        next QFFILES unless -f $path && -T _;
+        my $stat = compute_mail_stats( $path );
+        if (defined($stat)) {
+            $mail_stats->{Count}++;
+            merge_stats($mail_stats, $stat);
+        }
+    }
+    $dirent->close;
+    return $mail_stats;
+}
+

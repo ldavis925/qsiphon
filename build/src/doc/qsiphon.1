@@ -1,0 +1,123 @@
+.TH QSIPHON 1
+.SH NAME
+qsiphon - a utility for extracting qf/df files from an active mqueue directory
+.SH SYNOPSIS
+.B qsiphon [-MUhd] [-K seconds] <{ -L "host [, ...]" | -R "regex" }> indir/ <{ outdir/ | /dev/null }>
+
+.SH DESCRIPTION
+\fBqsiphon\fR is a utility that helps manage large volumes of mqueue (qf and df)
+files. This utility is useful when you have a large corpus of message queue files
+and would like to extract a portion of them out of the sendmail processing queue
+(\fB/var/spool/mqueue\fR) reliably without interfering with other processes
+working within the same directory.  \fBqsiphon\fR accomplishes this by issuing a
+call to \fBflock(2)\fR.
+
+\fBqsiphon\fR examines the contents of each qf file, and based on whether it matched a
+regular expression (given with the \fB-R\fR or \fB-L\fR options), or whether it should
+be kept based on its age (specified with \fB-K\fR) it either moves the qf (and associated
+df) files to the output directory, or it moves things that \fBDO NOT MATCH\fR into the output
+directory.  If the \fBoutdir\fR directory is \fB/dev/null\fR, or a dev null character device,
+then the action performed is a delete operation rather than moving the file(s).
+
+Please note that regular expression library in use by \fBqsiphon\fR is \fBpcre(3)\fR,
+the \fBPerl Compatible Regular Expressions\fR engine. See the man page for \fBpcre(3)\fR
+for more information on writing PCRE regular expressions.
+
+.SH OPTIONS
+.TP 10
+\fB-L \fI"host1 [, host2 ...]"\fR
+The \fB-L\fR switch is used when you want to match a list of hosts against SMTP
+\fBReceived\fR header fields.  The list of hosts should be contained within quotes and
+seperated with commas or spaces.  Using \fB-L\fR automatically generates an internal
+regular expression that is used to match against qf files' \fBReceived\fR entries.
+
+Note that the use of one of the \fB-L\fR or \fB-R\fR switches are mandatory and mutually
+exclusive (you must use one, but not both).
+.TP
+\fB-R \fI"expression"\fR
+The \fB-R\fR option does not match against any particular header field like \fB-L\fR does,
+rather it just performs straight regular expression matches against any portion of the qf
+file.
+
+Be aware that typical RE special characters (like \\s, \\w, etc), or any backslash
+quoted character for that matter should be written with \fBtwo\fR backslashes.  This is because
+the C programming language also makes use of the backslash for quoting special characters.
+So, for instance, to pass a backslash literal you must use two backslashes (e.g., to match one
+or more \fBspace\fR characters you would write \\\\s+).
+.TP
+\fB-K \fIseconds\fR
+Sometimes you may wish to keep or remove queue files that are a particular age.  This option
+allows the preservation or removal of qf/df file pairs newer (or older) than a specific
+number of seconds (depending on whether the \fB-M\fR option is used which inverts the default
+behavior).  This option has the effect of causing a match in the same sense that the \fB-L\fR,
+or \fB-R\fR switches cause a match.
+.TP
+\fB-M\fR
+The use of \fB-M\fR inverts the action associated with the matching logic.  Normally the
+default behavior is to move any qf/df pair that \fBDO NOT\fR match into the output directory.
+However, if you only wish to move qf/df files that MATCH then this option should be used.
+This is ideal for extracting vital messages from an active message queue.
+.TP
+\fB-U\fR
+Forces the deletion of qf files that do not have a matching df file pair.  The default behavior
+is to preserve them.
+.TP
+\fB-h\fR
+Print a short form of the command usage.
+.TP
+\fB-d\fR
+Print some debugging output when running.
+.TP
+\fBinput-directory\fR
+The input directory must exist and be readable and writable.
+.TP
+\fBoutput-directory\fR
+The output directory need not exist -- it will be automatically created if it's
+missing. Therefore its parent directory must be writable by \fBqsiphon\fR. If 
+the output directory is created it will be given the same user and group ownerships
+and file modes as the input directory.  If the output directory is \fB/dev/null\fR
+then the action performed on the files will be an unlink operation rathern than
+moving them.
+
+.SH EXAMPLES
+
+.PP
+.PD 0
+.TP
+.I qsiphon -L 'mx-submission, mx-feedback' -K 3600 -U /var/spool/mqueue /var/spool/removed
+
+Move all qf/df files to \fB/var/spool/removed\fR that do not contain "mx-submission", or "mx-feedback"
+in the mail headers' Received lines, or any file older than one hour.
+
+Delete any qf files that do not have matching df files.
+
+.TP
+.I qsiphon -L 'mx-submission, mx-feedback' -K 3600 -M /var/spool/mqueue /var/spool/saved
+
+Move all qf/df files to \fB/var/spool/saved\fR that match "mx-submission", or "mx-feedback"
+in the mail header Received entries, or any file newer than an hour.
+
+.TP
+.I qsiphon -R '^RPFD:.*me@upt\\\\.org' -M /var/spool/mqueue /var/spool/my-mails
+
+Move messages matching the regular expression given to the specified output directory
+(Note that the quoting meta-character (\\) was only used once because it appears in
+single quotes rather than double quotations).
+
+.TP
+.I qsiphon -U -M -R '^H\\\\?\\\\?Subject: Invoice# \\\\d+$' /var/spool/mqueue /dev/null
+
+Delete messages containing a particular string in the Subject header line.
+
+.SH SEE ALSO
+\fBpcre(3)\fR
+
+.SH DIAGNOSTICS
+Exit status is 0 unless an errors occurred, in which it exits with a non-zero status.
+
+.SH AUTHOR
+Lane Davis <qsiphon@upt.org>
+
+.SH UPDATED
+Last updated: Sep 07 2013
+.br

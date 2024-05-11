@@ -1,0 +1,8 @@
+Build an RPM with the following easy steps:
+
+* cd build
+
+* make rpm
+
+You will need the packages pcre and pcre-devel installed, as well as a functioning C compiler.
+

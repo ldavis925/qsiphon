@@ -1,0 +1,147 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use constant BASE_QS_SPOOLDIR   => '/var/spool/qsspool';
+use constant QSIPHON_EXEC       => '/usr/local/bin/qsiphon';
+use constant BASE_QUEUE_DIR     => '/var/spool/mqueue';
+use constant PATH_DEVNULL       => '/dev/null';
+
+use File::Spec::Functions;
+use File::Basename qw(dirname basename);
+use Sys::Syslog qw(:standard :macros);
+use Data::Dumper;
+use Getopt::Long;
+use IO::Dir;
+
+my $base_queue_dir  = BASE_QUEUE_DIR;
+my $qsiphon_exec    = QSIPHON_EXEC;
+my $spools_run      = 0;
+my @mail_queue_dirs = ();
+
+my ($opt_no_stats);
+GetOptions('N|no-stats' => \$opt_no_stats);
+
+exit(main(@ARGV));
+
+sub main {
+    my @args = @_;
+
+    die("The qsiphon utility must be installed to use this application\n")
+        unless ( $qsiphon_exec && -x $qsiphon_exec );
+    die("This script requires privilege (must be super-user)\n") if $>;
+
+    ##
+    ## Nothing to do if there aren't any spool files...
+    my $base_spool = BASE_QS_SPOOLDIR;
+    return 0 unless -d $base_spool;
+
+    ##
+    ## No longer use the MAILDIRS so you can copy qsiphon spools among hosts
+    @mail_queue_dirs = discover_multi_queues( $base_queue_dir );
+
+    ##
+    ## Will write to syslog for errors, messages, etc.
+    openlog("siphoncron", "pid", LOG_AUTH);
+
+    process_spools( $base_spool );
+
+    closelog();
+    return 0;
+}
+
+sub process_spools {
+    my ($spool_dir) = @_;
+    my ($before_count, $after_count);
+    return unless ( $spool_dir && -d $spool_dir );
+    my $dir = IO::Dir->new($spool_dir);
+    $before_count = mailq_count() unless $opt_no_stats;
+    DIRECT: while (defined(my $dirent = $dir->read)) {
+        next DIRECT if ( $dirent =~ /^\.\.?$/ );
+        my $path = catfile($spool_dir, $dirent);
+        next DIRECT unless ( $path && -f $path && $dirent =~ /^Q\w+-[YN]-\d+-\w+$/ );
+        process_single_spool( $path );
+    }
+    if ( $spools_run && !( $opt_no_stats ) ) {
+        $after_count  = mailq_count();
+        syslog(LOG_INFO, "mqueue count: before=%s, after=%s", $before_count, $after_count);
+    }
+    $dir->close();
+    return;
+}
+
+sub process_single_spool {
+    my ($path) = @_;
+    my ($file) = basename($path);
+    my ($app, $notif, $epoch) = $file =~ m{ ^ (Q\w+) - ([YN]) - (\d+) }x;
+    if (defined($epoch)) {
+        my $now = time();
+        if ( $now >= $epoch ) {
+            syslog(LOG_WARNING, "the spool '%s' has expired -- removing and skipping.",
+		basename($path));
+            unlink($path);
+            return;
+        }
+        my $spool_data = parse_spool($path);
+        run_spool($spool_data);
+        syslog(LOG_INFO, "processed spool file '%s'", basename($path));
+    }
+    return;
+}
+
+sub parse_spool {
+    my ($path) = @_;
+    return unless ( $path && -f $path );
+    local(*ARGV);
+    @ARGV = ( $path );
+    my @data = <>;
+    chomp @data;
+    my %data = map { ( split /\s*=\s*/, $_, 2 ) } @data;
+    $data{__path} = $path;
+    return \%data;
+}
+
+sub discover_multi_queues {
+    my ( $basedir ) = @_;
+    my @queuedirs   = ();
+
+    QDIR: for my $i ( 0 .. 9 ) {
+        my $qdir  = catdir( $basedir, sprintf( 'q%s' => $i ) );
+        my $isdir = ( $qdir && -d $qdir );
+        if ( $i == 0 ) {
+            unless ( $isdir ) {
+                push @queuedirs, $basedir;
+                last QDIR;
+            }
+        }
+        push @queuedirs, $qdir if ( $isdir );
+    }
+
+    return @queuedirs;
+}
+
+sub run_spool {
+    my ($sdata) =  @_;
+    my $regex   =  $sdata->{REGEX};
+    $regex      =~ s{^H\?\?}{H\\?\\?};
+    $regex      =~ s{^H}{^H};
+    my @mdirs   =  sort @mail_queue_dirs;
+    my $remdir  =  PATH_DEVNULL;
+    for my $mdir ( @mdirs ) {
+        my $cmd =  sprintf(qq{%s -U -M -R '%s' %s %s > /dev/null 2>&1},
+            $qsiphon_exec, $regex, $mdir, $remdir);
+        system($cmd) == 0 or syslog(LOG_ERR, "qsiphon failed: $?");
+        ++$spools_run;
+    }
+    return;
+}
+
+sub mailq_count {
+    my $cmd = q[/usr/bin/mailq | /usr/bin/tail -1 | awk '{ print $NF }'];
+    my $out = qx/$cmd/;
+    chomp($out);
+    $out =~ s/\D//g;
+    return ( $out || 0 );
+}
+

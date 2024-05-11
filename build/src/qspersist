@@ -1,0 +1,190 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Temp;
+use File::Path qw(mkpath);
+use File::Spec::Functions;
+use File::Basename qw(basename);
+use Getopt::Long;
+
+use constant DEFAULT_PERSISTENCE => '6h30m';
+use constant BASE_QS_SPOOLDIR    => '/var/spool/qsspool';
+
+my ($opt_hms, $opt_regex, $opt_help);
+
+sub hms_to_seconds {
+    my ($hms_str) = @_;
+    return unless $hms_str;
+
+    $hms_str = lc($hms_str);
+    my $seconds = 0;
+    my @matches = $hms_str =~ m{ ( \d+ [[:alpha:]] ) }xsmg;
+
+    for my $match (@matches) {
+        my ($inc, $type) = $match =~ m{ ( \d+ ) ( [[:alpha:]] ) }x;
+        SWITCH: {
+            $type eq 'h' && do {
+                $seconds += ( $inc * 3600 );
+                last SWITCH;
+            };
+
+            $type eq 'm' && do {
+                $seconds += ( $inc * 60 );
+                last SWITCH;
+            };
+
+            $type eq 's' && do {
+                $seconds += $inc;
+                last SWITCH;
+            };
+
+            print "Time designation '$type' is not valid.\n";
+            return;
+        }
+    }
+
+    return $seconds;
+}
+
+sub hms_to_epoch {
+    my ($hms_str) = @_;
+    return unless $hms_str;
+
+    my $now     = time();
+    my $seconds = hms_to_seconds($hms_str);
+    my $epoch   = $now + $seconds;
+
+    return ($now, $epoch, $seconds) if wantarray;
+    return $epoch;
+}
+
+sub hms_to_str {
+    my ($hms_str) = @_;
+    return unless $hms_str;
+
+    my $seconds = hms_to_seconds($hms_str);
+    my @desc    = ();
+
+    my $hours   = int( $seconds / 3600 );
+    $seconds    = $seconds % 3600;
+
+    my $minutes = int( $seconds / 60 );
+    $seconds    = $seconds % 60;
+
+    push @desc, sprintf('%s hour%s', $hours, ($hours == 1) ? '' : 's')
+        if $hours;
+    push @desc, sprintf('%s minute%s', $minutes, ($minutes == 1) ? '' : 's')
+        if $minutes;
+    push @desc, sprintf('%s second%s', $seconds, ($seconds == 1) ? '' : 's')
+        if $seconds;
+
+    return unless scalar(@desc);
+    return join(', ' => @desc);
+}
+
+sub prompt {
+    my ($prompt_str, $default) = @_;
+    print "$prompt_str";
+    if ($default) {
+        printf "%s%s", $default, "\b" x length($default);
+    }
+    my $input = <STDIN>;
+    chomp($input);
+
+    $input ||= $default if $default;
+    return $input;
+}
+
+sub usage {
+    my $basename = basename($0);
+    print "$basename [-h|--help] [-r|--regex='string'] [-t|--ttl=seconds]\n";
+    exit(0);
+}
+
+$| = 1;
+GetOptions('r|regex=s' => \$opt_regex, 't|ttl=s' => \$opt_hms, 'h|help' => \$opt_help);
+usage() if $opt_help;
+exit(main(@ARGV));
+
+sub main {
+    my @args = @_;
+
+    die("This script requires privilege (must be super-user)\n") if $>;
+
+    my $def_persist      = DEFAULT_PERSISTENCE;
+    my $def_persist_desc = hms_to_str( $def_persist );
+
+    my $persist;
+    if ($opt_hms) {
+        $persist = lc $opt_hms;
+    }
+    else {
+        $persist = prompt(
+            "Persist for [${def_persist} (${def_persist_desc}), 'q' to quit]: ",
+            $def_persist
+        );
+
+        $persist    = lc($persist);
+        if ($persist eq 'q') {
+            print "*** Break ***\n";
+            return 0;
+        }
+    }
+
+    my $regex;
+    REGEX: {
+        if ($opt_regex) {
+            $regex = $opt_regex;
+        }
+        else {
+            $regex = prompt( "Regular expression ['q' to quit]: " );
+            if (!($regex) || $regex eq 'q') {
+                print "*** Break ***\n";
+                return 0;
+            }
+        }
+        last REGEX if ( $regex =~ /^H\\?\?\\?\?\w+:/ );
+        print "Sendmail header regex must begin with 'H??Xxx:' where 'Xxx' denotes the header field\n";
+        $opt_regex = undef();
+        redo REGEX;
+    }
+
+    my $epoch = hms_to_epoch( $persist );
+    my $fname = create_spool($regex, $epoch);
+    print "Created spool: $fname\n";
+    return 0;
+}
+
+sub create_dir {
+    my ($dir, $perms) = @_;
+    return unless $dir;
+    mkpath $dir unless ( -d $dir );
+    chmod $perms, $dir if $perms;
+    return;
+}
+
+sub create_spool {
+    my ($regex, $epoch) = @_;
+
+    my $base_spool = BASE_QS_SPOOLDIR;
+    create_dir( $base_spool, 01777 );
+
+    my $template = sprintf('QC-N-%s-XXXXXX', $epoch);
+    my $fh = File::Temp->new(
+        DIR      => $base_spool,
+        TEMPLATE => $template,
+        UNLINK   => 0,
+    );
+
+    my $filename = $fh->filename();
+    $regex =~ s{^H\?\?}{H\\?\\?};
+
+    printf $fh "REGEX=%s\n", $regex;
+
+    $fh->close();
+    chmod( 0644, $filename );
+    return $filename;
+}
+

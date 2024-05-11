@@ -1,0 +1,16 @@
+root@ioctl:~/qsiphon-0.3/build> make rpm
+ls -1 /root/qsiphon-0.3/build/rpm/SOURCES/qsiphon-0.2-2.tar.gz
+/root/qsiphon-0.3/build/rpm/SOURCES/qsiphon-0.2-2.tar.gz
+Building target platforms: x86_64
+Building for target x86_64
+qsiphon.c: In function ‘qsiphon’:
+qsiphon.c:21:17: warning: variable ‘psetup’ set but not used [-Wunused-but-set-variable]
+     int         psetup,
+                 ^
+qlock.c: In function ‘main’:
+qlock.c:12:9: warning: variable ‘ch’ set but not used [-Wunused-but-set-variable]
+     int ch;
+         ^
+find /root/qsiphon-0.3/build/rpm/RPMS -name '*.rpm' -print
+/root/qsiphon-0.3/build/rpm/RPMS/x86_64/qsiphon-0.2-2.x86_64.rpm
+root@ioctl:~/qsiphon-0.3/build> vi qsiphon.c
